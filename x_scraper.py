@@ -283,42 +283,61 @@ def gql_user_id(session: requests.Session, screen_name: str, log: Callable[[str]
         raise RuntimeError(f"Nie znalazłem rest_id w odpowiedzi UserByScreenName: {j}") from e
 
 
-def _extract_entries_and_cursor(timeline_obj: dict) -> tuple[list[dict], str | None]:
-    """Walk a GraphQL timeline result; return (tweet itemContents, next cursor)."""
-    instructions: list[dict] = []
-    # several shapes possible — v2 etc.
-    candidates = [
-        timeline_obj.get("timeline_v2", {}).get("timeline", {}).get("instructions"),
-        timeline_obj.get("timeline", {}).get("instructions"),
-        timeline_obj.get("instructions"),
-    ]
-    for c in candidates:
-        if isinstance(c, list):
-            instructions = c
-            break
-    item_contents: list[dict] = []
+def _safe_get(obj, *path, default=None):
+    """obj[path[0]][path[1]]... tolerant of None / non-dict at any level."""
+    cur = obj
+    for k in path:
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        else:
+            return default
+    return cur if cur is not None else default
+
+
+def _walk_instructions(instructions: list, sink_items: list[dict]) -> str | None:
+    """Walk instructions list, append tweet itemContents to sink_items, return next cursor."""
     next_cursor: str | None = None
+    if not isinstance(instructions, list):
+        return None
     for inst in instructions:
-        if inst.get("type") in ("TimelineAddEntries", "TimelineAddToModule"):
-            for e in inst.get("entries", []) or inst.get("moduleItems", []):
+        if not isinstance(inst, dict):
+            continue
+        itype = inst.get("type")
+        if itype in ("TimelineAddEntries", "TimelineAddToModule"):
+            entries = inst.get("entries") or inst.get("moduleItems") or []
+            for e in entries:
                 content = e.get("content") or e.get("item") or {}
-                if content.get("entryType") == "TimelineTimelineModule" or "items" in content:
+                if not isinstance(content, dict):
+                    continue
+                entry_type = content.get("entryType") or ""
+                if entry_type == "TimelineTimelineModule" or isinstance(content.get("items"), list):
                     for it in content.get("items", []):
-                        ic = it.get("item", {}).get("itemContent") or it.get("itemContent")
+                        ic = _safe_get(it, "item", "itemContent") or it.get("itemContent")
                         if ic:
-                            item_contents.append(ic)
-                elif content.get("entryType") == "TimelineTimelineItem":
+                            sink_items.append(ic)
+                elif entry_type == "TimelineTimelineItem":
                     ic = content.get("itemContent")
                     if ic:
-                        item_contents.append(ic)
+                        sink_items.append(ic)
                 elif content.get("cursorType") == "Bottom":
                     next_cursor = content.get("value")
-        elif inst.get("type") == "TimelineReplaceEntry":
-            entry = inst.get("entry", {})
-            content = entry.get("content", {})
+        elif itype == "TimelineReplaceEntry":
+            content = _safe_get(inst, "entry", "content", default={})
             if content.get("cursorType") == "Bottom":
                 next_cursor = content.get("value")
-    return item_contents, next_cursor
+    return next_cursor
+
+
+def _dump_for_debug(j: dict, log: Callable[[str], None]) -> None:
+    """When response shape is unexpected, save raw JSON to disk and log a snippet."""
+    try:
+        _ensure_config_dir()
+        dump_path = CONFIG_DIR / "last_unexpected.json"
+        dump_path.write_text(json.dumps(j, indent=2)[:200_000])
+        log(f"  → surowa odpowiedź zapisana do: {dump_path}")
+    except Exception:
+        pass
+    log(f"  → snippet: {json.dumps(j)[:600]}")
 
 
 def gql_user_media_page(
@@ -351,17 +370,49 @@ def gql_user_media_page(
         raise RuntimeError(f"X odrzucił logowanie (HTTP {r.status_code}). Cookies wygasły — zaloguj ponownie.")
     r.raise_for_status()
     j = r.json()
+
     errs = j.get("errors")
-    if errs and not j.get("data"):
+    user_node = _safe_get(j, "data", "user")
+    if errs and not user_node:
         raise RuntimeError(f"GraphQL error: {errs}")
-    try:
-        timeline = j["data"]["user"]["result"].get("timeline_v2") or j["data"]["user"]["result"].get("timeline")
-        if timeline is None:
-            return [], None
-        entries, next_cursor = _extract_entries_and_cursor({"timeline_v2": j["data"]["user"]["result"].get("timeline_v2"), "timeline": j["data"]["user"]["result"].get("timeline")})
-    except (KeyError, TypeError) as e:
-        raise RuntimeError(f"Niespodziewany kształt odpowiedzi UserMedia: {e}") from e
-    return entries, next_cursor
+
+    # `user` may be the result directly, or wrap a `result` field
+    result = _safe_get(user_node, "result") if isinstance(_safe_get(user_node, "result"), dict) else user_node
+    if not result:
+        log("  ⚠ pusta `data.user` w odpowiedzi UserMedia.")
+        _dump_for_debug(j, log)
+        return [], None
+
+    typename = result.get("__typename") if isinstance(result, dict) else None
+    if typename and typename != "User":
+        log(f"  ⚠ wynik nie jest userem: __typename={typename} reason={result.get('reason')}")
+        _dump_for_debug(j, log)
+        return [], None
+
+    # Possible timeline locations across UserMedia versions
+    timeline_root = (
+        _safe_get(result, "timeline_v2")
+        or _safe_get(result, "timeline")
+        or _safe_get(result, "media_timeline")
+    )
+    if not timeline_root:
+        log("  ⚠ brak gałęzi timeline w odpowiedzi (timeline_v2 / timeline / media_timeline).")
+        _dump_for_debug(j, log)
+        return [], None
+
+    instructions = (
+        _safe_get(timeline_root, "timeline", "instructions")
+        or _safe_get(timeline_root, "instructions")
+        or []
+    )
+    if not instructions:
+        log("  ⚠ pusta lista instructions.")
+        _dump_for_debug(j, log)
+        return [], None
+
+    item_contents: list[dict] = []
+    next_cursor = _walk_instructions(instructions, item_contents)
+    return item_contents, next_cursor
 
 
 class RateLimited(Exception):
