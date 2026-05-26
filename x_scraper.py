@@ -539,38 +539,79 @@ class LoginDialog(tk.Toplevel):
         self.resizable(False, False)
         self.on_success = on_success
 
-        pad = {"padx": 12, "pady": 6}
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # --- TAB 1: auto-import
+        tab_auto = ttk.Frame(nb, padding=10)
+        nb.add(tab_auto, text="Auto-import z przeglądarki")
+
         ttk.Label(
-            self,
+            tab_auto,
             text=(
-                "Automatyczny import cookies z lokalnej przeglądarki.\n"
-                "Musisz być wcześniej zalogowany na x.com w wybranej przeglądarce.\n"
-                "Na macOS Chrome/Safari mogą poprosić o dostęp do keychain."
+                "Wymaga, żebyś był zalogowany na x.com w wybranej przeglądarce.\n"
+                "Chrome szyfruje cookies (Keychain na macOS, DPAPI na Windows) —\n"
+                "jeśli zobaczysz 'unable to get key for cookie decryption', spróbuj\n"
+                "Firefox / Safari, albo użyj zakładki obok (ręczna wklejka)."
             ),
             justify="left",
-        ).grid(row=0, column=0, columnspan=3, **pad, sticky="w")
-
-        ttk.Label(self, text="Przeglądarka:").grid(row=1, column=0, **pad, sticky="w")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(tab_auto, text="Przeglądarka:").grid(row=1, column=0, sticky="w", padx=(0, 6))
         self.browser_var = tk.StringVar(value=SUPPORTED_BROWSERS[0][0])
-        cb = ttk.Combobox(
-            self,
+        ttk.Combobox(
+            tab_auto,
             textvariable=self.browser_var,
             values=[b[0] for b in SUPPORTED_BROWSERS],
             state="readonly",
             width=20,
+        ).grid(row=1, column=1, sticky="w")
+        self.auto_status = tk.StringVar(value="")
+        ttk.Label(tab_auto, textvariable=self.auto_status, foreground="gray", wraplength=420, justify="left").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
-        cb.grid(row=1, column=1, **pad, sticky="w")
+        self.import_btn = ttk.Button(tab_auto, text="Importuj cookies", command=self._do_import)
+        self.import_btn.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
 
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status_var, foreground="gray").grid(
-            row=2, column=0, columnspan=3, **pad, sticky="w"
+        # --- TAB 2: manual paste
+        tab_manual = ttk.Frame(nb, padding=10)
+        nb.add(tab_manual, text="Wklej ręcznie")
+
+        ttk.Label(
+            tab_manual,
+            text=(
+                "Jak wyciągnąć cookies z przeglądarki:\n"
+                "1. Otwórz x.com w przeglądarce (musisz być zalogowany).\n"
+                "2. Naciśnij F12 (DevTools) → zakładka Application (Chrome/Edge)\n"
+                "   lub Storage (Firefox).\n"
+                "3. W lewym panelu: Cookies → https://x.com\n"
+                "4. Znajdź wiersze 'auth_token' i 'ct0', skopiuj kolumnę Value\n"
+                "   i wklej poniżej."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(tab_manual, text="auth_token:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+        self.auth_var = tk.StringVar()
+        ttk.Entry(tab_manual, textvariable=self.auth_var, width=58, show="•").grid(row=1, column=1, sticky="we", pady=2)
+
+        ttk.Label(tab_manual, text="ct0:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
+        self.ct0_var = tk.StringVar()
+        ttk.Entry(tab_manual, textvariable=self.ct0_var, width=58, show="•").grid(row=2, column=1, sticky="we", pady=2)
+
+        self.manual_status = tk.StringVar(value="")
+        ttk.Label(tab_manual, textvariable=self.manual_status, foreground="gray", wraplength=420, justify="left").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Button(tab_manual, text="Zapisz", command=self._do_manual).grid(
+            row=4, column=0, columnspan=2, sticky="e", pady=(10, 0)
         )
 
-        btn_frame = ttk.Frame(self)
-        btn_frame.grid(row=3, column=0, columnspan=3, **pad, sticky="e")
-        ttk.Button(btn_frame, text="Anuluj", command=self.destroy).pack(side="right", padx=4)
-        self.import_btn = ttk.Button(btn_frame, text="Importuj cookies", command=self._do_import)
-        self.import_btn.pack(side="right")
+        # Common cancel button
+        ttk.Button(self, text="Zamknij", command=self.destroy).pack(side="right", padx=10, pady=(0, 10))
+
+    def _finish(self) -> None:
+        self.on_success()
+        self.after(800, self.destroy)
 
     def _do_import(self) -> None:
         label = self.browser_var.get()
@@ -578,17 +619,31 @@ class LoginDialog(tk.Toplevel):
         if not bname:
             return
         self.import_btn.config(state="disabled")
-        self.status_var.set(f"Czytam cookies z {label}…")
+        self.auto_status.set(f"Czytam cookies z {label}…")
         self.update_idletasks()
         try:
             auth_token, ct0 = import_browser_cookies(bname)
             save_cookies(auth_token, ct0)
-            self.status_var.set("✓ Zapisano. Możesz zamknąć to okno.")
-            self.on_success()
-            self.after(800, self.destroy)
+            self.auto_status.set("✓ Zapisano. To okno zamknie się za chwilę.")
+            self._finish()
         except Exception as e:
-            self.status_var.set(f"Błąd: {e}")
+            self.auto_status.set(
+                f"Błąd: {e}\n→ spróbuj innej przeglądarki, albo przejdź do zakładki 'Wklej ręcznie'."
+            )
             self.import_btn.config(state="normal")
+
+    def _do_manual(self) -> None:
+        auth_token = self.auth_var.get().strip()
+        ct0 = self.ct0_var.get().strip()
+        if not auth_token or not ct0:
+            self.manual_status.set("Oba pola są wymagane.")
+            return
+        if len(auth_token) < 20 or len(ct0) < 20:
+            self.manual_status.set("Te wartości wyglądają na za krótkie — sprawdź czy skopiowałeś pełne Value.")
+            return
+        save_cookies(auth_token, ct0)
+        self.manual_status.set("✓ Zapisano. To okno zamknie się za chwilę.")
+        self._finish()
 
 
 class App:
