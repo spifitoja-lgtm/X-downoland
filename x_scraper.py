@@ -202,23 +202,45 @@ def save_query_ids(qids: dict[str, str]) -> None:
     QUERY_IDS_FILE.write_text(json.dumps(qids, indent=2))
 
 
-def discover_query_ids(session: requests.Session, log: Callable[[str], None]) -> dict[str, str]:
-    """Fetch the X.com bundle and extract operation→queryId mapping."""
+def discover_query_ids(log: Callable[[str], None]) -> dict[str, str]:
+    """Fetch the X.com bundle and extract operation→queryId mapping.
+
+    Uses an ANONYMOUS session — paradoxically more reliable than an authed one,
+    because authed cookies without a full browser fingerprint sometimes get
+    blocked by anti-bot heuristics, while the public HTML page is just public.
+    """
     log("Wykrywam query ID-eki z bundla X.com…")
-    home = session.get("https://x.com/home", headers={"User-Agent": UA}, timeout=30)
-    home.raise_for_status()
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    html = ""
+    last_err = None
+    for url in ("https://x.com/explore", "https://x.com/home", "https://x.com/i/flow/login"):
+        try:
+            r = s.get(url, timeout=30, allow_redirects=True)
+            if r.ok and r.text:
+                html = r.text
+                break
+            last_err = f"HTTP {r.status_code} na {url}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e} ({url})"
+    if not html:
+        raise RuntimeError(f"Nie udało się pobrać strony X.com do dyskaveri: {last_err}")
     js_urls = sorted(set(re.findall(
         r"https://abs\.twimg\.com/responsive-web/client-web/[A-Za-z0-9._/-]+\.js",
-        home.text,
+        html,
     )))
     if not js_urls:
-        raise RuntimeError("Nie znalazłem URL-i do bundla JS — X mógł zmienić layout.")
+        raise RuntimeError("Nie znalazłem URL-i do bundla JS — X mógł zmienić layout strony.")
     qids: dict[str, str] = {}
     pat_a = re.compile(r'queryId:"([^"]+)",operationName:"([^"]+)"')
     pat_b = re.compile(r'operationName:"([^"]+)",[^}]*?queryId:"([^"]+)"')
     for u in js_urls:
         try:
-            r = session.get(u, headers={"User-Agent": UA}, timeout=60)
+            r = s.get(u, timeout=60)
             if not r.ok:
                 continue
             for m in pat_a.finditer(r.text):
@@ -232,10 +254,10 @@ def discover_query_ids(session: requests.Session, log: Callable[[str], None]) ->
     return qids
 
 
-def get_query_id(session: requests.Session, name: str, log: Callable[[str], None]) -> str:
+def get_query_id(name: str, log: Callable[[str], None]) -> str:
     qids = load_query_ids()
     if name not in qids:
-        qids = discover_query_ids(session, log)
+        qids = discover_query_ids(log)
     if name not in qids:
         raise RuntimeError(f"Nie znalazłem query ID dla '{name}' — X bundle nie zawiera tej operacji.")
     return qids[name]
@@ -243,7 +265,7 @@ def get_query_id(session: requests.Session, name: str, log: Callable[[str], None
 
 # --------------------------------------------------------------------------- GraphQL calls
 def gql_user_id(session: requests.Session, screen_name: str, log: Callable[[str], None]) -> str:
-    qid = get_query_id(session, "UserByScreenName", log)
+    qid = get_query_id("UserByScreenName", log)
     url = f"https://x.com/i/api/graphql/{qid}/UserByScreenName"
     params = {
         "variables": json.dumps({"screen_name": screen_name}, separators=(",", ":")),
@@ -305,7 +327,7 @@ def gql_user_media_page(
     cursor: str | None,
     log: Callable[[str], None],
 ) -> tuple[list[dict], str | None]:
-    qid = get_query_id(session, "UserMedia", log)
+    qid = get_query_id("UserMedia", log)
     variables: dict = {
         "userId": user_id,
         "count": 100,
